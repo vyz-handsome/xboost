@@ -2,24 +2,31 @@ package com.xboost
 
 import android.content.Context
 
-/** Ubah setting global (animasi, freeform) dan ingat nilai aslinya untuk dikembalikan. */
+/**
+ * Ubah setting sistem dan ingat nilai aslinya untuk dikembalikan.
+ * Key biasa = namespace global. Pakai "system:nama" atau "secure:nama" untuk namespace lain.
+ */
 object SettingsGuard {
     val ANIM_KEYS = listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale")
-    val FREEFORM_KEYS = listOf("enable_freeform_support", "force_resizable_activities")
+
+    private fun ns(key: String) = if (':' in key) key.substringBefore(':') else "global"
+    private fun name(key: String) = key.substringAfter(':')
 
     fun set(ctx: Context, key: String, value: String) {
+        val n = ns(key); val k = name(key)
         if (Prefs.orig(ctx, key) == null) {
-            val cur = ShizukuShell.exec("settings get global $key").out.trim()
+            val cur = ShizukuShell.exec("settings get $n $k").out.trim()
             Prefs.setOrig(ctx, key, if (cur.isEmpty()) "null" else cur)
         }
-        ShizukuShell.exec("settings put global $key $value")
+        ShizukuShell.exec("settings put $n $k $value")
     }
 
     fun restoreAll(ctx: Context) {
-        Prefs.origKeys(ctx).forEach { k ->
-            val v = Prefs.orig(ctx, k)
-            if (v == null || v == "null") ShizukuShell.exec("settings delete global $k")
-            else ShizukuShell.exec("settings put global $k $v")
+        Prefs.origKeys(ctx).forEach { key ->
+            val n = ns(key); val k = name(key)
+            val v = Prefs.orig(ctx, key)
+            if (v == null || v == "null") ShizukuShell.exec("settings delete $n $k")
+            else ShizukuShell.exec("settings put $n $k $v")
         }
         Prefs.clearOrig(ctx)
     }

@@ -15,6 +15,9 @@ object Prefs {
     fun animOff(c: Context) = sp(c).getBoolean("anim_off", true)
     fun setAnimOff(c: Context, v: Boolean) = sp(c).edit().putBoolean("anim_off", v).apply()
 
+    fun maxPerf(c: Context) = sp(c).getBoolean("max_perf", true)
+    fun setMaxPerf(c: Context, v: Boolean) = sp(c).edit().putBoolean("max_perf", v).apply()
+
     @Synchronized fun suspended(c: Context): Set<String> =
         sp(c).getStringSet("suspended", emptySet())!!.toSet()
     @Synchronized fun addSuspended(c: Context, p: String) {

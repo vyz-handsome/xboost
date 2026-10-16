@@ -77,6 +77,7 @@ fun Screen() {
     var floats by remember { mutableStateOf(Prefs.floatApps(ctx)) }
     var wl by remember { mutableStateOf(Prefs.whitelist(ctx)) }
     var animOff by remember { mutableStateOf(Prefs.animOff(ctx)) }
+    var maxPerf by remember { mutableStateOf(Prefs.maxPerf(ctx)) }
     var status by remember { mutableStateOf("") }
     var showAdd by remember { mutableStateOf(false) }
 
@@ -190,6 +191,10 @@ fun Screen() {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Matikan animasi saat XBoost aktif", Modifier.weight(1f))
                     Switch(checked = animOff, onCheckedChange = { animOff = it; Prefs.setAnimOff(ctx, it) })
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Performa maksimal (hp lebih panas)", Modifier.weight(1f))
+                    Switch(checked = maxPerf, onCheckedChange = { maxPerf = it; Prefs.setMaxPerf(ctx, it) })
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(enabled = ready, onClick = { scope.launch { status = FocusEngine.boostMemory(ctx) } }) {

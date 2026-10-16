@@ -13,6 +13,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -27,22 +28,24 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import kotlinx.coroutines.*
+import kotlin.math.abs
 
 /**
  * Service foreground selama XBoost in-game aktif:
- * - pasang 2 handle tipis di pojok atas kiri & kanan layar (swipe ke dalam = buka panel)
- * - panel: info real time + tombol + daftar app floating
+ * - bubble melayang (bisa digeser) yang menampilkan FPS + suhu real time
+ * - tap bubble = panel lengkap (semua info, tombol, daftar app floating)
  * - memantau game: kalau game ditutup, mode dihentikan dan semua dipulihkan
  */
 class OverlayService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private lateinit var wm: WindowManager
     private lateinit var reader: StatsReader
-    private val handles = mutableListOf<View>()
+    private var bubble: TextView? = null
     private var scrim: FrameLayout? = null
     private var statsJob: Job? = null
     private var tickJob: Job? = null
     private var statsText: TextView? = null
+    private var lastStats: Stats? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -59,13 +62,12 @@ class OverlayService : Service() {
         }
         if (!Prefs.isActive(this)) { stopSelf(); return START_NOT_STICKY }
         startFg()
-        if (handles.isEmpty()) {
-            if (!android.provider.Settings.canDrawOverlays(this)) {
+        if (bubble == null) {
+            if (!Settings.canDrawOverlays(this)) {
                 Toast.makeText(this, "Izin overlay belum diberikan", Toast.LENGTH_LONG).show()
-            } else {
-                addHandle(true); addHandle(false)
-            }
+            } else addBubble()
         }
+        if (statsJob == null) startStats()
         if (tickJob == null) tickJob = scope.launch {
             while (isActive) {
                 delay(2500)
@@ -76,37 +78,86 @@ class OverlayService : Service() {
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-
     private fun overlayType() = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
 
-    // ---------- handle swipe ----------
-    private fun addHandle(left: Boolean) {
-        val v = View(this)
-        v.background = GradientDrawable().apply { setColor(0x44FFFFFF); cornerRadius = dp(7).toFloat() }
-        var downX = 0f
-        var fired = false
+    // ---------- bubble ----------
+    private fun addBubble() {
+        val size = dp(58)
+        val screenW = resources.displayMetrics.widthPixels
+        val bg = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(0xDD171A21.toInt())
+            setStroke(dp(2), 0xFF4CAF50.toInt())
+        }
+        val v = TextView(this).apply {
+            background = bg
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            textSize = 11f
+            setTypeface(typeface, Typeface.BOLD)
+            text = "XB"
+        }
+        val lp = WindowManager.LayoutParams(
+            size, size, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = screenW - size; y = dp(120)
+        }
+
+        var sx = 0; var sy = 0; var tx = 0f; var ty = 0f; var moved = false
         v.setOnTouchListener { _, e ->
             when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { downX = e.rawX; fired = false }
+                MotionEvent.ACTION_DOWN -> { sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY; moved = false }
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = e.rawX - downX
-                    if (!fired && ((left && dx > dp(36)) || (!left && dx < -dp(36)))) {
-                        fired = true
-                        showPanel(left)
+                    val dx = e.rawX - tx; val dy = e.rawY - ty
+                    if (abs(dx) > dp(6) || abs(dy) > dp(6)) moved = true
+                    if (moved) {
+                        lp.x = (sx + dx).toInt(); lp.y = (sy + dy).toInt()
+                        runCatching { wm.updateViewLayout(v, lp) }
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    val left = lp.x + size / 2 < screenW / 2
+                    if (!moved) showPanel(left)
+                    else {
+                        lp.x = if (left) 0 else screenW - size   // nempel ke sisi layar terdekat
+                        runCatching { wm.updateViewLayout(v, lp) }
                     }
                 }
             }
             true
         }
-        val lp = WindowManager.LayoutParams(
-            dp(14), dp(180), overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or (if (left) Gravity.START else Gravity.END)
-            y = dp(60)
-        }
         wm.addView(v, lp)
-        handles += v
+        bubble = v
+    }
+
+    private fun updateBubble(s: Stats) {
+        val b = bubble ?: return
+        val temp = s.cpuTemp ?: s.battTemp
+        b.text = "${s.fps ?: "-"} FPS\n${"%.0f".format(temp)}°C"
+        val color = when {
+            temp < 40f -> 0xFF4CAF50.toInt()
+            temp < 46f -> 0xFFFFC107.toInt()
+            else -> 0xFFF44336.toInt()
+        }
+        (b.background as? GradientDrawable)?.setStroke(dp(2), color)
+    }
+
+    private fun startStats() {
+        statsJob = scope.launch {
+            while (isActive) {
+                val game = Prefs.target(this@OverlayService) ?: break
+                val s = withContext(Dispatchers.IO) { runCatching { reader.read(game) }.getOrNull() }
+                if (s != null) {
+                    lastStats = s
+                    updateBubble(s)
+                    statsText?.text = fmt(s)
+                }
+                delay(if (scrim != null) 1000 else 3000)
+            }
+        }
     }
 
     // ---------- panel ----------
@@ -136,7 +187,8 @@ class OverlayService : Service() {
             setTypeface(typeface, Typeface.BOLD)
         })
         val st = TextView(this).apply {
-            text = "Memuat..."; setTextColor(0xFFB8C0CC.toInt()); textSize = 13f
+            text = lastStats?.let { fmt(it) } ?: "Memuat..."
+            setTextColor(0xFFB8C0CC.toInt()); textSize = 13f
             typeface = Typeface.MONOSPACE; setPadding(0, dp(10), 0, dp(10))
         }
         statsText = st
@@ -196,20 +248,13 @@ class OverlayService : Service() {
         )
         wm.addView(sc, lp)
         scrim = sc
-
-        statsJob = scope.launch {
-            while (isActive) {
-                val s = withContext(Dispatchers.IO) { runCatching { reader.read(game) }.getOrNull() }
-                if (s != null) statsText?.text = fmt(s)
-                delay(1000)
-            }
-        }
+        bubble?.visibility = View.GONE
     }
 
     private fun closePanel() {
-        statsJob?.cancel(); statsJob = null
         scrim?.let { runCatching { wm.removeView(it) } }
         scrim = null; statsText = null
+        bubble?.visibility = View.VISIBLE
     }
 
     private fun f(v: Float?, suf: String) = if (v == null) "-" else "%.0f%s".format(v, suf)
@@ -228,10 +273,16 @@ class OverlayService : Service() {
     private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
 
     // ---------- lifecycle ----------
+    private fun removeViews() {
+        scrim?.let { runCatching { wm.removeView(it) } }
+        scrim = null; statsText = null
+        bubble?.let { runCatching { wm.removeView(it) } }
+        bubble = null
+    }
+
     private suspend fun shutdown() {
-        closePanel()
-        handles.forEach { runCatching { wm.removeView(it) } }
-        handles.clear()
+        statsJob?.cancel(); statsJob = null
+        removeViews()
         withContext(Dispatchers.IO) { FocusEngine.restoreAll(applicationContext) }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -247,7 +298,7 @@ class OverlayService : Service() {
         val n = Notification.Builder(this, "focus")
             .setSmallIcon(android.R.drawable.ic_menu_manage)
             .setContentTitle("XBoost aktif")
-            .setContentText("Swipe dari pojok atas layar untuk buka panel")
+            .setContentText("Ketuk bubble untuk buka panel")
             .setOngoing(true)
             .addAction(Notification.Action.Builder(null, "Stop & pulihkan", restore).build())
             .build()
@@ -257,9 +308,7 @@ class OverlayService : Service() {
     }
 
     override fun onDestroy() {
-        closePanel()
-        handles.forEach { runCatching { wm.removeView(it) } }
-        handles.clear()
+        removeViews()
         scope.cancel()
         super.onDestroy()
     }

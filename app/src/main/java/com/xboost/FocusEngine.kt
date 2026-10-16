@@ -2,11 +2,14 @@ package com.xboost
 
 import android.app.ActivityManager
 import android.content.Context
+import android.hardware.display.DisplayManager
 import android.os.Build
+import android.view.Display
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.roundToInt
 
 object FocusEngine {
     /** pkg floating yang sedang dibuka -> jumlah cek berturut-turut yang tidak terlihat */
@@ -16,6 +19,7 @@ object FocusEngine {
     private const val MISS_LIMIT = 8       // 8 x 2,5 dtk = 20 dtk game tidak terlihat -> mode berhenti
     @Volatile private var startedAt = 0L
     @Volatile private var gameMiss = 0
+    @Volatile private var tickCount = 0
 
     private val VISIBLE = Regex("visible(Requested)?=true", RegexOption.IGNORE_CASE)
     private val PKG_IN_HEAD = Regex(" ([A-Za-z0-9._]+)/")
@@ -32,6 +36,31 @@ object FocusEngine {
         ShizukuShell.exec("am force-stop $pkg; pm suspend --user 0 $pkg")
     }
 
+    /**
+     * Dorong performa game semaksimal yang bisa tanpa root (hp bisa lebih panas):
+     * Game Mode performance, fixed performance mode, framework thermal status di-override,
+     * battery saver dimatikan, refresh rate dikunci ke maksimum layar.
+     * Frekuensi CPU/GPU langsung tidak bisa dikunci tanpa root.
+     */
+    private fun boostPerformance(ctx: Context, game: String) {
+        val cmds = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= 31) {
+            cmds += "cmd game mode performance $game"
+            cmds += "cmd power set-fixed-performance-mode-enabled true"
+        }
+        if (Build.VERSION.SDK_INT >= 29) cmds += "cmd thermalservice override-status 0"
+        if (cmds.isNotEmpty()) ShizukuShell.exec(cmds.joinToString("; "))
+        SettingsGuard.set(ctx, "low_power", "0")
+        val hz = runCatching {
+            (ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
+                .getDisplay(Display.DEFAULT_DISPLAY).supportedModes.maxOf { it.refreshRate }.roundToInt()
+        }.getOrNull()
+        if (hz != null && hz > 0) {
+            SettingsGuard.set(ctx, "system:min_refresh_rate", hz.toString())
+            SettingsGuard.set(ctx, "system:peak_refresh_rate", hz.toString())
+        }
+    }
+
     /** Fokuskan game: bekukan semua app user lain, matikan animasi (opsional), Game Mode performance. */
     suspend fun start(ctx: Context, game: String, animOff: Boolean): String = withContext(Dispatchers.IO) {
         if (!ShizukuShell.isReady()) return@withContext "Shizuku belum siap"
@@ -42,10 +71,12 @@ object FocusEngine {
         Prefs.setActive(ctx, true)
         startedAt = System.currentTimeMillis()
         gameMiss = 0
+        tickCount = 0
         if (animOff) SettingsGuard.ANIM_KEYS.forEach { SettingsGuard.set(ctx, it, "0") }
         val victims = AppRepo.userPackages().filter { it !in keep }
         victims.forEach { freeze(ctx, it) }
-        if (Build.VERSION.SDK_INT >= 31) ShizukuShell.exec("cmd game mode performance $game")
+        if (Prefs.maxPerf(ctx)) boostPerformance(ctx, game)
+        else if (Build.VERSION.SDK_INT >= 31) ShizukuShell.exec("cmd game mode performance $game")
         delay(500)
         "XBoost aktif: ${victims.size} app dibekukan. RAM bebas ${before}MB -> ${freeRamMb(ctx)}MB"
     }
@@ -57,6 +88,8 @@ object FocusEngine {
             if (AppRepo.safe(it)) ShizukuShell.exec("pm unsuspend --user 0 $it")
         }
         Prefs.clearSuspended(ctx)
+        val resetGame = Prefs.target(ctx)?.takeIf { AppRepo.safe(it) }?.let { "; cmd game mode standard $it" } ?: ""
+        ShizukuShell.exec("cmd power set-fixed-performance-mode-enabled false; cmd thermalservice reset$resetGame")
         SettingsGuard.restoreAll(ctx)
         floating.clear()
         Prefs.setActive(ctx, false)
@@ -96,6 +129,9 @@ object FocusEngine {
      */
     suspend fun tick(ctx: Context): Boolean = withContext(Dispatchers.IO) {
         val game = Prefs.target(ctx) ?: return@withContext true
+        tickCount++
+        if (tickCount % 24 == 0 && Prefs.maxPerf(ctx)) // ~tiap 1 menit: tegaskan ulang mode performa + bersihkan background
+            ShizukuShell.exec("cmd power set-fixed-performance-mode-enabled true; am kill-all")
         val dump = ShizukuShell.exec("dumpsys activity activities").out
         if (dump.isBlank()) return@withContext false // Shizuku/dumpsys gagal, jangan ambil keputusan
         val vis = visiblePackages(dump)
