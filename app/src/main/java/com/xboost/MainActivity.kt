@@ -1,9 +1,13 @@
 package com.xboost
 
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -11,8 +15,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -27,27 +34,98 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
+fun AppIcon(pkg: String, size: Dp = 40.dp) {
+    val ctx = LocalContext.current
+    val bmp = remember(pkg) {
+        runCatching { ctx.packageManager.getApplicationIcon(pkg).toBitmap(96, 96).asImageBitmap() }.getOrNull()
+    }
+    if (bmp != null) Image(bitmap = bmp, contentDescription = null, modifier = Modifier.size(size))
+    else Spacer(Modifier.size(size))
+}
+
+/** Daftar app dengan checkbox; dipakai untuk tambah game, app floating, dan whitelist. */
+@Composable
+fun AppPicker(apps: List<AppEntry>, selected: Set<String>, onToggle: (String) -> Unit, modifier: Modifier = Modifier) {
+    LazyColumn(modifier) {
+        items(apps, key = { it.pkg }) { a ->
+            Row(
+                Modifier.fillMaxWidth().clickable { onToggle(a.pkg) }.padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Checkbox(checked = a.pkg in selected, onCheckedChange = { onToggle(a.pkg) })
+                AppIcon(a.pkg, 32.dp)
+                Spacer(Modifier.width(10.dp))
+                Text(a.label, maxLines = 1)
+            }
+        }
+    }
+}
+
+@Composable
 fun Screen() {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+    var tab by remember { mutableStateOf(0) }
     var running by remember { mutableStateOf(false) }
     var ready by remember { mutableStateOf(false) }
+    var overlayOk by remember { mutableStateOf(true) }
     var active by remember { mutableStateOf(Prefs.isActive(ctx)) }
+    var activeTarget by remember { mutableStateOf(Prefs.target(ctx)) }
     var leftover by remember { mutableStateOf(false) }
-    var apps by remember { mutableStateOf(listOf<AppEntry>()) }
-    var target by remember { mutableStateOf(Prefs.target(ctx)) }
-    var animOff by remember { mutableStateOf(Prefs.animOff(ctx)) }
+    var all by remember { mutableStateOf(listOf<AppEntry>()) }
+    var games by remember { mutableStateOf(Prefs.games(ctx)) }
+    var floats by remember { mutableStateOf(Prefs.floatApps(ctx)) }
     var wl by remember { mutableStateOf(Prefs.whitelist(ctx)) }
+    var animOff by remember { mutableStateOf(Prefs.animOff(ctx)) }
     var status by remember { mutableStateOf("") }
+    var showAdd by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
-        apps = withContext(Dispatchers.IO) { AppRepo.launchable(ctx) }
+        all = withContext(Dispatchers.IO) { AppRepo.launchable(ctx) }
         while (true) {
             running = ShizukuShell.isRunning()
             ready = ShizukuShell.isReady()
+            overlayOk = Settings.canDrawOverlays(ctx)
             active = Prefs.isActive(ctx)
+            activeTarget = Prefs.target(ctx)
             leftover = !active && Prefs.suspended(ctx).isNotEmpty()
             delay(1000)
+        }
+    }
+
+    fun launchApp(pkg: String) {
+        ctx.packageManager.getLaunchIntentForPackage(pkg)?.let {
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(it)
+        }
+    }
+
+    fun startGame(pkg: String) {
+        if (!overlayOk) {
+            ctx.startActivity(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${ctx.packageName}"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            status = "Beri izin tampil di atas app lain dulu, lalu coba lagi"
+            return
+        }
+        if (active) {
+            if (activeTarget == pkg) launchApp(pkg) else status = "XBoost masih aktif untuk game lain, hentikan dulu"
+            return
+        }
+        scope.launch {
+            status = FocusEngine.start(ctx, pkg, animOff)
+            if (Prefs.isActive(ctx)) {
+                ctx.startForegroundService(Intent(ctx, OverlayService::class.java))
+                launchApp(pkg)
+            }
+        }
+    }
+
+    fun stopAll() {
+        scope.launch {
+            status = FocusEngine.restoreAll(ctx)
+            ctx.stopService(Intent(ctx, OverlayService::class.java))
         }
     }
 
@@ -61,6 +139,12 @@ fun Screen() {
             }
         )
         if (running && !ready) Button(onClick = { ShizukuShell.requestPermission() }) { Text("Beri izin Shizuku") }
+        if (!overlayOk) Button(onClick = {
+            ctx.startActivity(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${ctx.packageName}"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }) { Text("Beri izin overlay (panel swipe)") }
 
         if (leftover) {
             Card(Modifier.fillMaxWidth()) {
@@ -71,50 +155,65 @@ fun Screen() {
             }
         }
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Matikan animasi saat mode aktif", Modifier.weight(1f))
-            Switch(checked = animOff, onCheckedChange = { animOff = it; Prefs.setAnimOff(ctx, it) })
+        TabRow(selectedTabIndex = tab) {
+            Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Game") })
+            Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Floating") })
+            Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Lainnya") })
         }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (!active) {
-                Button(enabled = ready && target != null, onClick = {
-                    val t = target ?: return@Button
-                    scope.launch {
-                        status = FocusEngine.start(ctx, t, animOff)
-                        ctx.startForegroundService(Intent(ctx, FocusService::class.java))
-                        ctx.packageManager.getLaunchIntentForPackage(t)?.let { ctx.startActivity(it) }
+        when (tab) {
+            0 -> {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Button(onClick = { showAdd = true }) { Text("+ Tambah game") }
+                    if (active) OutlinedButton(onClick = { stopAll() }) { Text("Hentikan XBoost") }
+                }
+                val gameApps = all.filter { it.pkg in games }
+                if (gameApps.isEmpty()) Text("Belum ada game. Tekan \"Tambah game\".")
+                LazyColumn(Modifier.weight(1f)) {
+                    items(gameApps, key = { it.pkg }) { g ->
+                        Card(Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { startGame(g.pkg) }) {
+                            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                AppIcon(g.pkg, 44.dp)
+                                Spacer(Modifier.width(12.dp))
+                                Text(g.label, Modifier.weight(1f), maxLines = 1)
+                                Text(if (active && activeTarget == g.pkg) "Berjalan" else "Mulai")
+                            }
+                        }
                     }
-                }) { Text("Mulai Mode Fokus") }
-            } else {
-                Button(onClick = {
-                    scope.launch {
-                        status = FocusEngine.restoreAll(ctx)
-                        ctx.stopService(Intent(ctx, FocusService::class.java))
-                    }
-                }) { Text("Hentikan & pulihkan") }
-            }
-            OutlinedButton(enabled = ready, onClick = { scope.launch { status = FocusEngine.boostMemory(ctx) } }) {
-                Text("Kosongkan RAM")
-            }
-        }
-        if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
-
-        Text(if (active) "Mode aktif. Pilih app untuk dibuka floating:" else "Pilih app yang mau difokuskan (WL = whitelist, tidak dibekukan):")
-        LazyColumn(Modifier.weight(1f)) {
-            items(apps, key = { it.pkg }) { a ->
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    RadioButton(selected = target == a.pkg, enabled = !active,
-                        onClick = { target = a.pkg; Prefs.setTarget(ctx, a.pkg) })
-                    Text(a.label, Modifier.weight(1f), maxLines = 1)
-                    TextButton(onClick = { Prefs.toggleWhitelist(ctx, a.pkg); wl = Prefs.whitelist(ctx) }) {
-                        Text(if (a.pkg in wl) "WL ✓" else "WL")
-                    }
-                    if (active) TextButton(onClick = {
-                        scope.launch { status = FocusEngine.launchFloating(ctx, a.pkg) }
-                    }) { Text("Float") }
                 }
             }
+            1 -> {
+                Text("Pilih app yang muncul di panel XBoost untuk dibuka floating:")
+                AppPicker(all, floats, { Prefs.toggleFloat(ctx, it); floats = Prefs.floatApps(ctx) }, Modifier.weight(1f))
+            }
+            else -> {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Matikan animasi saat XBoost aktif", Modifier.weight(1f))
+                    Switch(checked = animOff, onCheckedChange = { animOff = it; Prefs.setAnimOff(ctx, it) })
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(enabled = ready, onClick = { scope.launch { status = FocusEngine.boostMemory(ctx) } }) {
+                        Text("Kosongkan RAM")
+                    }
+                    OutlinedButton(onClick = { scope.launch { status = FocusEngine.restoreAll(ctx) } }) { Text("Pulihkan semua") }
+                }
+                Text("Whitelist (tidak pernah dibekukan):")
+                AppPicker(all, wl, { Prefs.toggleWhitelist(ctx, it); wl = Prefs.whitelist(ctx) }, Modifier.weight(1f))
+            }
         }
+
+        if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
+    }
+
+    if (showAdd) {
+        AlertDialog(
+            onDismissRequest = { showAdd = false },
+            confirmButton = { TextButton(onClick = { showAdd = false }) { Text("Selesai") } },
+            title = { Text("Tambah game") },
+            text = {
+                AppPicker(all, games, { Prefs.toggleGame(ctx, it); games = Prefs.games(ctx) },
+                    Modifier.heightIn(max = 420.dp))
+            }
+        )
     }
 }

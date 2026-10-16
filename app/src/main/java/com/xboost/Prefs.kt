@@ -25,12 +25,19 @@ object Prefs {
     }
     @Synchronized fun clearSuspended(c: Context) = sp(c).edit().remove("suspended").commit()
 
-    fun whitelist(c: Context): Set<String> =
-        sp(c).getStringSet("whitelist", emptySet())!!.toSet()
-    fun toggleWhitelist(c: Context, p: String) {
-        val w = whitelist(c)
-        sp(c).edit().putStringSet("whitelist", if (p in w) w - p else w + p).apply()
+    private fun getSet(c: Context, k: String): Set<String> =
+        sp(c).getStringSet(k, emptySet())!!.toSet()
+    private fun toggle(c: Context, k: String, p: String) {
+        val w = getSet(c, k)
+        sp(c).edit().putStringSet(k, if (p in w) w - p else w + p).apply()
     }
+
+    fun whitelist(c: Context) = getSet(c, "whitelist")
+    fun toggleWhitelist(c: Context, p: String) = toggle(c, "whitelist", p)
+    fun games(c: Context) = getSet(c, "games")
+    fun toggleGame(c: Context, p: String) = toggle(c, "games", p)
+    fun floatApps(c: Context) = getSet(c, "float_apps")
+    fun toggleFloat(c: Context, p: String) = toggle(c, "float_apps", p)
 
     // nilai asli setting sistem (animasi, freeform) untuk dikembalikan
     fun orig(c: Context, key: String): String? = sp(c).getString("orig_$key", null)
